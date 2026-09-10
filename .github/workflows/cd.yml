@@ -1,0 +1,116 @@
+name: Continuous Delivery
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }} \
+            -t ghcr.io/${{ github.repository }}:latest \
+            .
+
+      - name: Push Docker image
+        run: |
+          docker push ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}
+          docker push ghcr.io/${{ github.repository }}:latest
+
+  deploy-staging:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+    steps:
+      - name: Deploy to staging
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_USER }}
+          key: ${{ secrets.STAGING_SSH_KEY }}
+          script: |
+            docker pull \
+              ghcr.io/${{ github.repository }}:${{ needs.build.outputs.version }}
+            docker stop mlops-api || true
+            docker rm mlops-api || true
+            docker run -d \
+              --name mlops-api \
+              --restart unless-stopped \
+              -p 5000:5000 \
+              ghcr.io/${{ github.repository }}:${{ needs.build.outputs.version }}
+
+      - name: Verify staging deployment
+        run: |
+          sleep 5
+          curl --fail \
+            http://${{ secrets.STAGING_HOST }}:5000/health
+
+  deploy-production:
+    needs:
+      - build
+      - deploy-staging
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    steps:
+      - name: Deploy production
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.PRODUCTION_HOST }}
+          username: ${{ secrets.PRODUCTION_USER }}
+          key: ${{ secrets.PRODUCTION_SSH_KEY }}
+          script: |
+            docker pull \
+              ghcr.io/${{ github.repository }}:${{ needs.build.outputs.version }}
+            docker stop mlops-api || true
+            docker rm mlops-api || true
+            docker run -d \
+              --name mlops-api \
+              --restart unless-stopped \
+              -p 5000:5000 \
+              ghcr.io/${{ github.repository }}:${{ needs.build.outputs.version }}

@@ -1,0 +1,6 @@
+services:
+  mlops-api:
+    build: .
+    container_name: mlops-api
+    ports:
+      - "5000:5000"
